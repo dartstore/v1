@@ -1,42 +1,35 @@
 import { Inject, Injectable } from '@nestjs/common'
 import * as crypto from 'crypto'
-import { KEY_PROVIDER, KeyProvider } from './key-provider.interface'
-
-const ALGORITHM = 'aes-256-gcm'
-const IV_LENGTH = 12
-const TAG_LENGTH = 16
-const DEK_LENGTH = 32
-
-/** إصدار صيغة envelope الخاص بمفاتيح المتاجر */
-const ENVELOPE_VERSION = 1
+import {
+  assertKeyVersion,
+  buildAad,
+  CIPHER_ALGORITHM,
+  DERIVED_KEY_LENGTH,
+  DecryptionError,
+  ENVELOPE_HEADER_LENGTH,
+  ENVELOPE_VERSION,
+  EncryptionContext,
+  EnvelopeScope,
+  IV_LENGTH,
+  KEY_PROVIDER,
+  KeyProvider,
+  OFFSET_CIPHERTEXT,
+  OFFSET_DERIVED_KEY_VERSION,
+  OFFSET_ENVELOPE_VERSION,
+  OFFSET_IV,
+  OFFSET_KEK_VERSION,
+  OFFSET_SCOPE,
+  OFFSET_TAG,
+  packEnvelopeHeader,
+  wipe,
+} from './key-provider.interface'
 
 /** نسخة المفتاح المشتق الافتراضية لأي متجر جديد */
 export const DEFAULT_DEK_VERSION = 1
 
-/**
- * تخطيط الـ envelope (نسخة 1):
- *
- *   [0]       envelope_version  (1 byte)
- *   [1]       kek_version       (1 byte)
- *   [2]       dek_version       (1 byte)
- *   [3..14]   iv                (12 bytes)
- *   [15..30]  auth_tag          (16 bytes)
- *   [31..]    ciphertext
- *
- * التخطيط ده بيتخزّن في قاعدة البيانات، يعني بيبقى دائم من أول نص
- * مشفّر بيتكتب. أي تعديل عليه لازم يبقى بإصدار جديد، مش تعديل مكانه.
- */
-const V1_VERSION_OFFSET = 0
-const V1_KEK_VERSION_OFFSET = 1
-const V1_DEK_VERSION_OFFSET = 2
-const V1_IV_OFFSET = 3
-const V1_TAG_OFFSET = V1_IV_OFFSET + IV_LENGTH
-const V1_CIPHERTEXT_OFFSET = V1_TAG_OFFSET + TAG_LENGTH
-const V1_HEADER_LENGTH = V1_CIPHERTEXT_OFFSET
-
-/** نتيجة التشفير — الـ envelope مع نسخ المفاتيح المستخدمة */
+/** ناتج التشفير — النص المخزّن مع نسخ المفاتيح المستخدمة */
 export interface StoreEnvelope {
-  /** النص المشفّر في base64 — ده اللي بيتخزّن */
+  /** النص المشفّر في base64 — ده اللي بيتخزّن في العمود */
   payload: string
   /** نسخة المفتاح الجذري المستخدمة */
   kekVersion: number
@@ -47,26 +40,38 @@ export interface StoreEnvelope {
 /**
  * تشفير بيانات المتاجر بمفتاح مشتق لكل متجر على حدة.
  *
- * الفكرة: بدل ما نخزّن مفتاح منفصل لكل متجر في جدول (وده بيجيب معاه
- * مشكلة توليد وتوزيع وحماية المفاتيح)، بنشتق المفتاح رياضياً من
- * المفتاح الجذري:
+ * الاشتقاق:
  *
  *   DEK = HKDF-SHA256(
  *           ikm  = KEK[kek_version],
  *           salt = "store:<store_id>",
- *           info = "dek:v<dek_version>",
- *           len  = 32
- *         )
+ *           info = "dek:v<dek_version>:kek:v<kek_version>",
+ *           len  = 32)
  *
- * النتيجة:
- *   • مفيش جدول مفاتيح ومفيش مراسم توليد.
- *   • كل متجر ليه مفتاح مختلف تماماً — تسريب مفتاح متجر مايكشفش غيره.
+ * ليه اشتقاق بدل جدول مفاتيح:
+ *   • مفيش جدول، ولا مراسم توليد، ولا مشكلة توزيع.
+ *   • كل متجر ليه مفتاح مختلف تماماً.
  *   • تدوير مفتاح متجر واحد = زيادة dek_version بتاعه بس.
  *   • تدوير المفتاح الجذري = زيادة kek_version، والقديم يفضل متاح
  *     للفك لحد ما إعادة التشفير تخلص.
  *
- * نسخ المفاتيح بتتكتب جوه الـ envelope نفسه، فأي نص مشفّر بيحمل معاه
- * المعلومات اللازمة لفكّه.
+ * طبقتين عزل مختلفتين — الاتنين لازمين:
+ *
+ *   1. **بين المتاجر** — عن طريق مفتاح مشتق مختلف. متجر مايقدرش
+ *      يفك تشفير بيانات متجر تاني، حتى لو نقلنا الصف بنفسنا.
+ *
+ *   2. **جوه المتجر الواحد** — عن طريق الـ AAD. كل الصفوف بتاعة نفس
+ *      المتجر بتستخدم نفس الـ DEK، فمن غير AAD كان ينفع تنقل النص
+ *      المشفّر من صف test لصف live، أو من بوابة لبوابة، وهيتفك عادي.
+ *      الـ AAD بيربط النص بـ (المتجر، الوضع، نوع الصف، معرّف الصف،
+ *      اسم الحقل) وبيخلي النقل ده يفشل.
+ *
+ * ملاحظة على الأداء: المفتاح بيتشتق مع كل عملية ومابيتخزّنش في كاش.
+ * HKDF-SHA256 عمليتين HMAC بس (ميكروثانية)، والمقابل إننا مابنحتفظش
+ * بمفاتيح مستأجرين في الذاكرة لفترات طويلة. المقايضة دي مقصودة.
+ *
+ * حدود الاستخدام: نفس حد الـ IV العشوائي (~2^32 عملية لكل مفتاح).
+ * مناسب للاعتمادات، مش للبيانات عالية الحجم.
  */
 @Injectable()
 export class StoreKeyService {
@@ -75,166 +80,289 @@ export class StoreKeyService {
   ) {}
 
   /**
-   * يشتق مفتاح البيانات الخاص بمتجر معيّن.
+   * يشتق مفتاح البيانات الخاص بمتجر.
    *
-   * دالة خالصة (deterministic): نفس المدخلات بترجّع نفس المفتاح دايماً.
-   * public عشان الاختبارات تقدر تتحقق من خاصية العزل بين المتاجر.
+   * دالة حتمية: نفس المدخلات بترجّع نفس المفتاح دايماً.
+   * public عشان الاختبارات تقدر تتحقق من خاصية العزل مباشرةً.
+   *
+   * المسؤولية على المستدعي إنه يمسح الناتج (wipe) بعد الاستخدام.
    */
-  deriveStoreKey(
+  async deriveStoreKey(
     storeId: bigint | number | string,
     dekVersion: number = DEFAULT_DEK_VERSION,
-    kekVersion: number = this.keyProvider.currentVersion(),
-  ): Buffer {
-    if (!Number.isInteger(dekVersion) || dekVersion < 1 || dekVersion > 255) {
-      throw new Error(`dek_version لازم يكون رقم صحيح بين 1 و 255 (${dekVersion}).`)
-    }
+    kekVersion?: number,
+  ): Promise<Buffer> {
+    assertKeyVersion('dek_version', dekVersion)
+
+    const resolvedKekVersion =
+      kekVersion ?? (await this.keyProvider.currentKekVersion())
+
+    assertKeyVersion('kek_version', resolvedKekVersion)
 
     const normalizedStoreId = this.normalizeStoreId(storeId)
-    const kek = this.keyProvider.getKek(kekVersion)
+    const kek = await this.keyProvider.getKek(resolvedKekVersion)
 
-    const salt = Buffer.from(`store:${normalizedStoreId}`, 'utf8')
-    const info = Buffer.from(`dek:v${dekVersion}`, 'utf8')
+    try {
+      const derived = crypto.hkdfSync(
+        'sha256',
+        kek,
+        Buffer.from(`store:${normalizedStoreId}`, 'utf8'),
+        Buffer.from(`dek:v${dekVersion}:kek:v${resolvedKekVersion}`, 'utf8'),
+        DERIVED_KEY_LENGTH,
+      )
 
-    // crypto.hkdfSync بترجّع ArrayBuffer، فبنلفّها في Buffer
-    const derived = crypto.hkdfSync('sha256', kek, salt, info, DEK_LENGTH)
-
-    return Buffer.from(derived)
+      return Buffer.from(derived)
+    } finally {
+      wipe(kek)
+    }
   }
 
-  /** يشفّر نص عادي لمتجر معيّن */
-  encryptForStore(
+  /**
+   * يشفّر نص عادي لمتجر معيّن.
+   *
+   * @param storeId    معرّف المتجر
+   * @param plainText  النص
+   * @param context    سياق ثابت بيتربط بيه النص
+   * @param dekVersion نسخة مفتاح المتجر (بتزيد عند تدوير مفتاح المتجر)
+   */
+  async encryptForStore(
     storeId: bigint | number | string,
     plainText: string,
+    context: EncryptionContext,
     dekVersion: number = DEFAULT_DEK_VERSION,
-  ): StoreEnvelope {
-    const kekVersion = this.keyProvider.currentVersion()
+  ): Promise<StoreEnvelope> {
+    assertKeyVersion('dek_version', dekVersion)
 
-    if (kekVersion < 1 || kekVersion > 255) {
-      throw new Error(`kek_version لازم يكون بين 1 و 255 (${kekVersion}).`)
-    }
+    const kekVersion = await this.keyProvider.currentKekVersion()
+    assertKeyVersion('kek_version', kekVersion)
 
-    const dek = this.deriveStoreKey(storeId, dekVersion, kekVersion)
-
-    const iv = crypto.randomBytes(IV_LENGTH)
-    const cipher = crypto.createCipheriv(ALGORITHM, dek, iv)
-
-    const encrypted = Buffer.concat([
-      cipher.update(plainText, 'utf8'),
-      cipher.final(),
-    ])
-    const authTag = cipher.getAuthTag()
-
-    const header = Buffer.alloc(3)
-    header.writeUInt8(ENVELOPE_VERSION, V1_VERSION_OFFSET)
-    header.writeUInt8(kekVersion, V1_KEK_VERSION_OFFSET)
-    header.writeUInt8(dekVersion, V1_DEK_VERSION_OFFSET)
-
-    return {
-      payload: Buffer.concat([header, iv, authTag, encrypted]).toString(
-        'base64',
-      ),
-      kekVersion,
+    const normalizedStoreId = this.normalizeStoreId(storeId)
+    const dek = await this.deriveStoreKey(
+      normalizedStoreId,
       dekVersion,
+      kekVersion,
+    )
+
+    try {
+      const iv = crypto.randomBytes(IV_LENGTH)
+      const aad = buildAad(EnvelopeScope.Store, normalizedStoreId, context)
+
+      const cipher = crypto.createCipheriv(CIPHER_ALGORITHM, dek, iv)
+      cipher.setAAD(aad)
+
+      const encrypted = Buffer.concat([
+        cipher.update(plainText, 'utf8'),
+        cipher.final(),
+      ])
+      const authTag = cipher.getAuthTag()
+
+      const header = packEnvelopeHeader({
+        envelopeVersion: ENVELOPE_VERSION,
+        scope: EnvelopeScope.Store,
+        kekVersion,
+        derivedKeyVersion: dekVersion,
+      })
+
+      return {
+        payload: Buffer.concat([header, iv, authTag, encrypted]).toString(
+          'base64',
+        ),
+        kekVersion,
+        dekVersion,
+      }
+    } finally {
+      wipe(dek)
     }
   }
 
   /**
    * يفك تشفير envelope خاص بمتجر.
    *
-   * نسخ المفاتيح بتتقرأ من الـ envelope نفسه، فمش محتاجين نمرّرها.
-   * لو الـ storeId غلط، الـ auth tag هيفشل والدالة هترمي خطأ — وده
-   * بالظبط خاصية العزل اللي عايزينها.
+   * نسخ المفاتيح بتتقرأ من الـ envelope نفسه. السياق لازم يبقى نفسه
+   * اللي اتشفّر بيه بالظبط.
+   *
+   * @throws {DecryptionError} بـ reason='integrity' لو المتجر غلط، أو
+   *         السياق مختلف، أو في عبث بالبيانات
    */
-  decryptForStore(
+  async decryptForStore(
     storeId: bigint | number | string,
     payload: string,
-  ): string {
+    context: EncryptionContext,
+  ): Promise<string> {
     const raw = Buffer.from(payload, 'base64')
 
-    if (raw.length <= V1_HEADER_LENGTH) {
-      throw new Error('نص مشفّر تالف: الحجم أصغر من الحد الأدنى.')
-    }
-
-    const envelopeVersion = raw.readUInt8(V1_VERSION_OFFSET)
-
-    if (envelopeVersion !== ENVELOPE_VERSION) {
-      throw new Error(
-        `إصدار envelope غير معروف (${envelopeVersion}). ` +
-          `الإصدار المدعوم حالياً: ${ENVELOPE_VERSION}.`,
+    if (raw.length <= ENVELOPE_HEADER_LENGTH) {
+      throw new DecryptionError(
+        'malformed',
+        'نص مشفّر تالف: الحجم أصغر من الحد الأدنى.',
       )
     }
 
-    const kekVersion = raw.readUInt8(V1_KEK_VERSION_OFFSET)
-    const dekVersion = raw.readUInt8(V1_DEK_VERSION_OFFSET)
+    const envelopeVersion = raw.readUInt8(OFFSET_ENVELOPE_VERSION)
 
-    const dek = this.deriveStoreKey(storeId, dekVersion, kekVersion)
+    if (envelopeVersion !== ENVELOPE_VERSION) {
+      throw new DecryptionError(
+        'unsupported_version',
+        `إصدار envelope غير معروف (${envelopeVersion}). ` +
+          `الإصدار المدعوم: ${ENVELOPE_VERSION}.`,
+      )
+    }
 
-    const iv = raw.subarray(V1_IV_OFFSET, V1_TAG_OFFSET)
-    const authTag = raw.subarray(V1_TAG_OFFSET, V1_CIPHERTEXT_OFFSET)
-    const encrypted = raw.subarray(V1_CIPHERTEXT_OFFSET)
+    const scope = raw.readUInt8(OFFSET_SCOPE)
 
-    const decipher = crypto.createDecipheriv(ALGORITHM, dek, iv)
-    decipher.setAuthTag(authTag)
+    if (scope !== EnvelopeScope.Store) {
+      throw new DecryptionError(
+        'malformed',
+        `النص ده نطاقه ${scope} مش نطاق متجر. ` +
+          `لو نطاقه المنصة استخدم EncryptionService.`,
+      )
+    }
 
-    const decrypted = Buffer.concat([
-      decipher.update(encrypted),
-      decipher.final(),
-    ])
+    const kekVersion = raw.readUInt16BE(OFFSET_KEK_VERSION)
+    const dekVersion = raw.readUInt16BE(OFFSET_DERIVED_KEY_VERSION)
 
-    return decrypted.toString('utf8')
+    const normalizedStoreId = this.normalizeStoreId(storeId)
+
+    let dek: Buffer
+
+    try {
+      dek = await this.deriveStoreKey(
+        normalizedStoreId,
+        dekVersion,
+        kekVersion,
+      )
+    } catch (error) {
+      throw new DecryptionError('key_unavailable', (error as Error).message)
+    }
+
+    try {
+      const iv = raw.subarray(OFFSET_IV, OFFSET_TAG)
+      const authTag = raw.subarray(OFFSET_TAG, OFFSET_CIPHERTEXT)
+      const encrypted = raw.subarray(OFFSET_CIPHERTEXT)
+      const aad = buildAad(EnvelopeScope.Store, normalizedStoreId, context)
+
+      const decipher = crypto.createDecipheriv(CIPHER_ALGORITHM, dek, iv)
+      decipher.setAAD(aad)
+      decipher.setAuthTag(authTag)
+
+      const decrypted = Buffer.concat([
+        decipher.update(encrypted),
+        decipher.final(),
+      ])
+
+      return decrypted.toString('utf8')
+    } catch (error) {
+      if (error instanceof DecryptionError) throw error
+
+      throw new DecryptionError(
+        'integrity',
+        'فشل التحقق من سلامة النص المشفّر. ' +
+          'الاحتمالات: متجر غلط، أو سياق مختلف (وضع/صف/حقل)، ' +
+          'أو عبث بالبيانات. الحالة دي تستدعي تنبيه أمني.',
+      )
+    } finally {
+      wipe(dek)
+    }
   }
 
   /** helper: يشفّر object كامل لمتجر */
-  encryptJsonForStore(
+  async encryptJsonForStore(
     storeId: bigint | number | string,
     obj: Record<string, any>,
+    context: EncryptionContext,
     dekVersion: number = DEFAULT_DEK_VERSION,
-  ): StoreEnvelope {
-    return this.encryptForStore(storeId, JSON.stringify(obj), dekVersion)
+  ): Promise<StoreEnvelope> {
+    return this.encryptForStore(
+      storeId,
+      JSON.stringify(obj),
+      context,
+      dekVersion,
+    )
   }
 
-  /** helper: يفك ويرجّع object، أو null لو مفيش بيانات أو فشل الفك */
-  decryptJsonForStore<T = Record<string, any>>(
+  /**
+   * helper: يفك ويرجّع object.
+   *
+   * ⚠️ بيرجّع null بس لو المدخل فاضي. أخطاء السلامة بترمي
+   * DecryptionError عشان العبث مايتخفيش ورا قيمة فاضية.
+   */
+  async decryptJsonForStore<T = Record<string, any>>(
     storeId: bigint | number | string,
     payload: string | null | undefined,
-  ): T | null {
+    context: EncryptionContext,
+  ): Promise<T | null> {
     if (!payload) return null
 
-    try {
-      return JSON.parse(this.decryptForStore(storeId, payload)) as T
-    } catch {
-      return null
+    return JSON.parse(
+      await this.decryptForStore(storeId, payload, context),
+    ) as T
+  }
+
+  /**
+   * يقرأ بيانات الهيدر من غير فك تشفير.
+   * مفيدة في تحديد الصفوف المحتاجة إعادة تشفير بعد تدوير المفاتيح.
+   */
+  readEnvelopeHeader(payload: string): {
+    envelopeVersion: number
+    scope: number
+    kekVersion: number
+    dekVersion: number
+  } {
+    const raw = Buffer.from(payload, 'base64')
+
+    if (raw.length <= ENVELOPE_HEADER_LENGTH) {
+      throw new DecryptionError(
+        'malformed',
+        'نص مشفّر تالف: الحجم أصغر من الحد الأدنى.',
+      )
+    }
+
+    return {
+      envelopeVersion: raw.readUInt8(OFFSET_ENVELOPE_VERSION),
+      scope: raw.readUInt8(OFFSET_SCOPE),
+      kekVersion: raw.readUInt16BE(OFFSET_KEK_VERSION),
+      dekVersion: raw.readUInt16BE(OFFSET_DERIVED_KEY_VERSION),
     }
   }
 
   /**
-   * يقرأ نسخ المفاتيح من envelope من غير ما يفك التشفير.
-   * مفيدة في التقارير وفي تحديد أي الصفوف محتاجة إعادة تشفير بعد التدوير.
+   * توحيد معرّف المتجر **عددياً**.
+   *
+   * BigInt و number و string لازم يدّوا نفس المفتاح، و "042" لازم
+   * تدّي نفس مفتاح 42. التوحيد النصي البسيط (trim) كان هيخلي الشكلين
+   * دول مفتاحين مختلفين، ونص مشفّر يبقى مستحيل فكّه لو الاستدعاء
+   * التاني جه بشكل مختلف.
    */
-  readEnvelopeVersions(
-    payload: string,
-  ): { envelopeVersion: number; kekVersion: number; dekVersion: number } {
-    const raw = Buffer.from(payload, 'base64')
-
-    if (raw.length <= V1_HEADER_LENGTH) {
-      throw new Error('نص مشفّر تالف: الحجم أصغر من الحد الأدنى.')
+  private normalizeStoreId(storeId: bigint | number | string): string {
+    if (typeof storeId === 'bigint') {
+      return this.assertNonNegative(storeId)
     }
 
-    return {
-      envelopeVersion: raw.readUInt8(V1_VERSION_OFFSET),
-      kekVersion: raw.readUInt8(V1_KEK_VERSION_OFFSET),
-      dekVersion: raw.readUInt8(V1_DEK_VERSION_OFFSET),
+    if (typeof storeId === 'number') {
+      if (!Number.isSafeInteger(storeId)) {
+        throw new Error(
+          `store_id لازم يكون عدد صحيح آمن (استلمنا: ${storeId}).`,
+        )
+      }
+      return this.assertNonNegative(BigInt(storeId))
     }
+
+    const trimmed = String(storeId).trim()
+
+    if (!/^\d+$/.test(trimmed)) {
+      throw new Error(
+        `store_id لازم يكون رقم صحيح موجب (استلمنا: "${storeId}").`,
+      )
+    }
+
+    return this.assertNonNegative(BigInt(trimmed))
   }
 
-  /** توحيد شكل معرّف المتجر — BigInt و number و string لازم يدّوا نفس المفتاح */
-  private normalizeStoreId(storeId: bigint | number | string): string {
-    const value = String(storeId).trim()
-
-    if (value.length === 0) {
-      throw new Error('store_id مطلوب لاشتقاق مفتاح المتجر.')
+  private assertNonNegative(value: bigint): string {
+    if (value < 0n) {
+      throw new Error(`store_id ماينفعش يكون سالب (استلمنا: ${value}).`)
     }
 
-    return value
+    return value.toString()
   }
 }
