@@ -1,137 +1,146 @@
-import { Injectable, Logger } from '@nestjs/common'
-import { PrismaService } from '../../prisma/prisma.service'
+import { PrismaClient } from '@prisma/client'
+import {
+  IdReservationError,
+  IdReservationService,
+  RESERVABLE_TABLES,
+  ReservableTable,
+} from './id-reservation.service'
+import {
+  createAdditionalClient,
+  resetTestDatabase,
+  startTestDatabase,
+  stopTestDatabase,
+} from '../../../test/db-test-harness'
 
 /**
- * ══════════════════════════════════════════════════════════════════
- * حجز المعرّفات قبل الإدراج
- * ══════════════════════════════════════════════════════════════════
+ * اختبارات تكامل على Postgres حقيقي.
  *
- * ليه موجودة أصلاً:
- *
- * صيغة الـ AAD المجمّدة (common/crypto) بتربط كل نص مشفّر بـ
- * (المتجر، الوضع، نوع الصف، **معرّف الصف**، اسم الحقل). يعني المعرّف
- * لازم يكون معروف **قبل** التشفير، مش بعد الإدراج.
- *
- * البديل — إدراج الصف الأول وبعدين تشفير وتحديث — معناه إن الصف
- * بيتولد ثانية بقيمة غير مشفّرة أو فاضية، وإن كل كتابة بتبقى عمليتين.
- * ده اللي رفضناه.
- *
- * الآلية:
- *
- *   nextval(pg_get_serial_sequence('table','id'))
- *
- * خصائص مهمة:
- *   • ذرّية — استدعاءين متوازيين مستحيل يرجّعوا نفس الرقم.
- *   • **مش تفاعلية مع الـ transaction** — الـ sequence بتتقدّم حتى لو
- *     الـ transaction اترجعت. وده المطلوب بالظبط: معرّف اتربط بيه نص
- *     مشفّر ماينفعش يترجع للاستخدام تاني.
- *   • بتسيب فجوات في الأرقام. الفجوات دي طبيعية ومتوقعة ومش مشكلة.
- *
- * ⚠️ قيد على المرحلة 1b: أي جدول هيخزّن نص مشفّر مربوط بـ AAD لازم
- * يكون مفتاحه BigInt مربوط بـ sequence. ممنوع UUID أو معرّف بيتولد
- * في التطبيق للجداول دي.
+ * RESERVABLE_TABLES فاضية في 1a، فبنسجّل جدول اختباري عليها مؤقتاً
+ * (outbox_messages) عشان نتحقق من الآلية نفسها. أول جدول حقيقي هيتسجّل
+ * في المرحلة 1b.
  */
 
-/** الجداول المسموح الحجز منها — قائمة صريحة بدل اسم جدول حر */
-export interface ReservableTable {
-  /** اسم الجدول في قاعدة البيانات (اللي في @@map) */
-  readonly table: string
-  /** عمود المفتاح الأساسي */
-  readonly column: string
-}
+const TEST_KEY = '__spec_outbox'
+const TEST_TARGET: ReservableTable = { table: 'outbox_messages', column: 'id' }
 
-/**
- * فاضية في المرحلة 1a: مفيش جدول بيخزّن نص مشفّر لسه.
- * المرحلة 1b هتضيف payment_accounts وأخواته.
- */
-export const RESERVABLE_TABLES: Readonly<Record<string, ReservableTable>> = {}
+describe('IdReservationService (integration)', () => {
+  let prisma: PrismaClient
+  let service: IdReservationService
 
-export class IdReservationError extends Error {
-  constructor(message: string) {
-    super(message)
-    this.name = 'IdReservationError'
-    Object.setPrototypeOf(this, IdReservationError.prototype)
-  }
-}
+  beforeAll(async () => {
+    prisma = await startTestDatabase()
+    ;(RESERVABLE_TABLES as Record<string, ReservableTable>)[TEST_KEY] = TEST_TARGET
+    service = new IdReservationService(prisma as never)
+  }, 120_000)
 
-/** أقصى عدد معرّفات في الحجز الواحد — حاجز أمان ضد استدعاء بالغلط */
-const MAX_BATCH = 1000
+  afterAll(async () => {
+    delete (RESERVABLE_TABLES as Record<string, ReservableTable>)[TEST_KEY]
+    await stopTestDatabase()
+  })
 
-@Injectable()
-export class IdReservationService {
-  private readonly logger = new Logger(IdReservationService.name)
+  beforeEach(async () => {
+    await resetTestDatabase()
+  })
 
-  constructor(private readonly prisma: PrismaService) {}
+  it('reserves a bigint id', async () => {
+    const id = await service.reserve(TEST_KEY)
+    expect(typeof id).toBe('bigint')
+    expect(id).toBeGreaterThan(0n)
+  })
 
-  /**
-   * يحجز معرّف واحد.
-   *
-   * بيتنفّذ خارج أي transaction عن قصد — حتى لو المستدعي جوه واحدة،
-   * nextval مالهاش علاقة بالـ transaction، والمعرّف المحجوز مش هيترجع.
-   */
-  async reserve(key: string): Promise<bigint> {
-    const [id] = await this.reserveMany(key, 1)
-    return id
-  }
+  it('never returns the same id twice', async () => {
+    const ids = await Promise.all(
+      Array.from({ length: 50 }, () => service.reserve(TEST_KEY)),
+    )
+    expect(new Set(ids.map(String)).size).toBe(50)
+  })
 
-  /**
-   * يحجز مجموعة معرّفات متتالية.
-   *
-   * مفيدة للإدراج بالجملة: بنجيب كل المعرّفات مرة واحدة، بنشفّر، وبعدين
-   * createMany في عملية واحدة.
-   */
-  async reserveMany(key: string, count: number): Promise<bigint[]> {
-    const target = this.resolve(key)
+  it('reserves a batch of distinct ids', async () => {
+    const ids = await service.reserveMany(TEST_KEY, 20)
+    expect(ids).toHaveLength(20)
+    expect(new Set(ids.map(String)).size).toBe(20)
+  })
 
-    if (!Number.isSafeInteger(count) || count < 1) {
-      throw new IdReservationError(
-        `عدد المعرّفات لازم يكون عدد صحيح موجب (استلمنا: ${count}).`,
-      )
+  it('does not recycle an id across separate connections', async () => {
+    const second = createAdditionalClient()
+    const secondService = new IdReservationService(second as never)
+
+    try {
+      const batches = await Promise.all([
+        service.reserveMany(TEST_KEY, 100),
+        secondService.reserveMany(TEST_KEY, 100),
+      ])
+      const all = batches.flat().map(String)
+      expect(new Set(all).size).toBe(200)
+    } finally {
+      await second.$disconnect()
     }
+  })
 
-    if (count > MAX_BATCH) {
-      throw new IdReservationError(
-        `الحد الأقصى للحجز الواحد ${MAX_BATCH} معرّف (طُلب: ${count}).`,
-      )
-    }
+  it('does not recycle an id when the caller transaction rolls back', async () => {
+    let reserved: bigint | undefined
 
-    // القيم متمرّرة كباراميترات مش مدمجة في النص، فمفيش أي احتمال حقن.
-    // pg_get_serial_sequence بتاخد أسماء نصية، فالباراميترات شغالة معاها.
-    const rows = await this.prisma.$queryRaw<{ id: bigint }[]>`
-      SELECT nextval(pg_get_serial_sequence(${target.table}, ${target.column})) AS id
-      FROM generate_series(1, ${count})
-    `
+    await expect(
+      prisma.$transaction(async () => {
+        reserved = await service.reserve(TEST_KEY)
+        throw new Error('rollback')
+      }),
+    ).rejects.toThrow('rollback')
 
-    if (rows.length !== count) {
-      throw new IdReservationError(
-        `توقعنا ${count} معرّف من ${target.table} واستلمنا ${rows.length}.`,
-      )
-    }
+    const afterRollback = await service.reserve(TEST_KEY)
 
-    return rows.map((row) => {
-      const value = row.id
-      if (typeof value !== 'bigint') {
-        // بعض إعدادات الدرايفر بترجّع string لأنواع bigint
-        return BigInt(value as unknown as string)
-      }
-      return value
+    // ده جوهر القرار: المعرّف اللي اتربط بيه نص مشفّر ماينفعش يرجع
+    expect(afterRollback).toBeGreaterThan(reserved as bigint)
+  })
+
+  it('tolerates gaps in the sequence', async () => {
+    const first = await service.reserve(TEST_KEY)
+    await service.reserveMany(TEST_KEY, 10) // متستخدمش
+    const later = await service.reserve(TEST_KEY)
+
+    expect(later - first).toBeGreaterThan(1n)
+  })
+
+  it('rejects an unregistered table', async () => {
+    await expect(service.reserve('does_not_exist')).rejects.toThrow(
+      IdReservationError,
+    )
+  })
+
+  it('rejects invalid batch sizes', async () => {
+    await expect(service.reserveMany(TEST_KEY, 0)).rejects.toThrow(
+      IdReservationError,
+    )
+    await expect(service.reserveMany(TEST_KEY, -1)).rejects.toThrow(
+      IdReservationError,
+    )
+    await expect(service.reserveMany(TEST_KEY, 1.5)).rejects.toThrow(
+      IdReservationError,
+    )
+    await expect(service.reserveMany(TEST_KEY, 1001)).rejects.toThrow(
+      IdReservationError,
+    )
+  })
+
+  it('produces ids usable as explicit primary keys', async () => {
+    const id = await service.reserve(TEST_KEY)
+
+    await prisma.outboxMessage.create({
+      data: {
+        id,
+        store_id: 1n,
+        mode: 'live',
+        aggregate_type: 'spec',
+        aggregate_id: '1',
+        event_type: 'spec.event',
+        payload: {},
+        occurred_at: new Date(),
+      },
     })
-  }
 
-  /** يتأكد إن الجدول مسجّل في القائمة المسموحة */
-  private resolve(key: string): ReservableTable {
-    const target = RESERVABLE_TABLES[key]
-
-    if (!target) {
-      const available = Object.keys(RESERVABLE_TABLES)
-      throw new IdReservationError(
-        `الجدول "${key}" مش مسجّل في RESERVABLE_TABLES. ` +
-          (available.length > 0
-            ? `المتاح: [${available.join(', ')}].`
-            : `القائمة فاضية حالياً — أول جدول هيتضاف في المرحلة 1b.`),
-      )
-    }
-
-    return target
-  }
-}
+    const found = await prisma.outboxMessage.findFirst({
+      where: { id, store_id: 1n, mode: 'live' },
+    })
+    expect(found?.id).toBe(id)
+  })
+})
