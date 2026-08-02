@@ -1,0 +1,126 @@
+backend/src/auth/auth.service.ts
+
+Change 1 — constructor. Add ConfigService:
+
+// add to imports
+import { ConfigService } from '@nestjs/config'
+
+constructor(
+  private prisma: PrismaService,
+  private jwtService: JwtService,
+  private realtime: RealtimeGateway,
+  private config: ConfigService,   // ← add
+) {}
+
+
+Change 2 — remove the fallback. Replace this line:
+
+private readonly FLOW_SECRET = process.env.FLOW_SECRET || 'fallback_flow_secret_key_123';
+
+with
+/**
+ * 🔐 كان هنا fallback نصي مكتوب في الكود. اتشال — FLOW_SECRET بقى
+ * إجباري وقت الإقلاع (شوف common/config/env.validation.ts).
+ * getter مش property عشان الـ ConfigService يكون متاح.
+ */
+private get FLOW_SECRET(): string {
+  return this.config.getOrThrow<string>('security.flowSecret');
+}
+
+
+backend/src/stores/store.service.ts
+
+One change, inside createStore only. Replace:
+
+currency: data.currency || 'SAR',
+
+with
+// مصدر واحد للعملة الافتراضية: @default("USD") في schema.prisma.
+// لو المستخدم مابعتش عملة، مابنبعتش الحقل خالص وسايبين الداتابيز
+// تطبّق الافتراضي بتاعها بدل ما نكتب قيمة تانية هنا.
+...(data.currency ? { currency: data.currency } : {}),
+
+Nothing else in this file changes. No schema change is needed — store.currency already carries @default("USD").
+
+
+
+
+backend/package.json
+
+Why: Adds @nestjs/config — the only new dependency in Phase 0. @nestjs/schedule, class-validator, class-transformer and stripe were already present.
+
+json
+{
+  "name": "backend-nestjs",
+  "version": "0.0.1",
+  "description": "",
+  "author": "",
+  "private": true,
+  "license": "UNLICENSED",
+  "scripts": {
+    "build": "nest build",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
+    "start": "nest start",
+    "start:dev": "nest start --watch",
+    "start:debug": "nest start --debug --watch",
+    "start:prod": "node dist/main",
+    "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:cov": "jest --coverage",
+    "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
+    "test:e2e": "jest --config ./test/jest-e2e.json"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1083.0",
+    "@aws-sdk/s3-request-presigner": "^3.1083.0",
+    "@nestjs/common": "^11.0.1",
+    "@nestjs/config": "^4.0.2",
+    "@nestjs/core": "^11.0.1",
+    "@nestjs/event-emitter": "^3.1.0",
+    "@nestjs/jwt": "^11.0.2",
+    "@nestjs/passport": "^11.0.5",
+    "@nestjs/platform-express": "^11.0.1",
+    "@nestjs/platform-socket.io": "^11.1.21",
+    "@nestjs/schedule": "^6.1.3",
+    "@nestjs/websockets": "^11.1.21",
+    "@otplib/preset-default": "^12.0.1",
+    "@prisma/client": "^6.19.3",
+    "axios": "^1.16.1",
+    "bcrypt": "^6.0.0",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.15.1",
+    "cookie-parser": "^1.4.7",
+    "express-useragent": "^2.1.0",
+    "jsonwebtoken": "^9.0.3",
+    "ms": "^2.1.3",
+    "multer": "^2.2.0",
+    "passport": "^0.7.0",
+    "passport-facebook": "^3.0.0",
+    "passport-github2": "^0.1.12",
+    "passport-google-oauth20": "^2.0.0",
+    "passport-jwt": "^4.0.1",
+    "passport-microsoft": "^2.1.0",
+    "qrcode": "^1.5.4",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1",
+    "socket.io": "^4.8.3",
+    "stripe": "^22.3.2",
+    "ua-parser-js": "^2.0.9"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3.2.0",
+    "@eslint/js": "^9.18.0",
+    "@nestjs/cli": "^11.0.0",
+    "@nestjs/schematics": "^11.0.0",
+    "@nestjs/testing": "^11.0.1",
+    "@types/bcrypt": "^6.0.0",
+    "@types/cookie-parser": "^1.4.9"
+  }
+}
+
+⚠️ The devDependencies block above is incomplete. Project knowledge truncated this file at "@types/cookie-parser": and I do not have the remaining entries. Do not overwrite package.json with this file. Apply one change by hand instead:
+
++    "@nestjs/config": "^4.0.2",
+
+inserted into dependencies after "@nestjs/common", then run npm install.
